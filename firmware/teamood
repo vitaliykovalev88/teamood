@@ -1,0 +1,296 @@
+/*
+  ESP32 Mood Teapot — color-speaking kettle
+  Author: Vitaly Kovalev
+  
+  Features:
+  - Reads motion/orientation from MPU-6050 (I2C)
+  - Optional tilt/position switch on a GPIO
+  - Listens to microphone (envelope) via ADC
+  - Drives 30 WS2812 RGB LEDs according to inferred "mood"
+  - Non-blocking timing (millis), simple EMA filters
+
+  Dependencies (install via Arduino Library Manager):
+  - Adafruit MPU6050 (and Adafruit Unified Sensor)
+  - Adafruit BusIO
+  - Adafruit NeoPixel
+
+  Board: ESP32 (Arduino core)
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_NeoPixel.h>
+
+/********************** CONFIGURATION ***************************/
+// --- LED strip ---
+#define LED_PIN         5       // WS2812 data pin (use GPIO that supports RMT; 5, 18, 19, 21, 23 are ok)
+#define NUM_LEDS        30
+#define LED_BRIGHTNESS  140     // 0..255
+
+// --- Microphone ---
+#define MIC_PIN         34      // ADC1 only on ESP32 (32, 33, 34, 35, 36, 39)
+#define MIC_SAMPLES     16      // per update (small for responsiveness)
+#define MIC_REF_12BIT   4095.0f // ADC resolution
+#define MIC_DC_EMA_A    0.995f  // DC tracking (closer to 1 = slower)
+#define MIC_ENV_EMA_A   0.8f    // Envelope smoothing
+
+// --- Position sensor (optional tilt / reed switch) ---
+#define POS_PIN         27      // set to -1 to disable
+#define POS_ACTIVE_LOW  1       // 1 if switch pulls to GND when active
+
+// --- I2C ---
+#define I2C_SDA         21
+#define I2C_SCL         22
+
+// --- Mood update rates ---
+#define SENSOR_HZ       100     // internal sampling loop
+#define MOOD_HZ         10      // decision rate
+
+// --- Pour detection (from accelerometer orientation) ---
+#define POUR_PITCH_DEG  45.0f   // tilt threshold for pour
+#define POUR_HOLD_MS    200     // debounce
+
+/********************** GLOBALS ***************************/
+Adafruit_MPU6050 mpu;
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// Microphone processing
+float mic_dc = 0.0f;      // DC offset estimate
+float mic_env = 0.0f;     // envelope (0..1 approx)
+
+// Motion/orientation
+float acc_mag = 0.0f;     // g magnitude deviation
+float pitch_deg = 0.0f;
+float roll_deg  = 0.0f;
+
+// Position switch
+bool pos_active = false;
+
+// Timing
+uint32_t lastSensorMs = 0;
+uint32_t lastMoodMs = 0;
+uint32_t pourStartMs = 0;
+bool pouring = false;
+
+// Mood enum
+enum Mood { CALM, JOY, FOCUS, TIRED, INSPIRE, PLAYFUL, POURING };
+Mood currentMood = CALM;
+
+/********************** UTILS ***************************/
+static inline float clampf(float x, float a, float b){ return x < a ? a : (x > b ? b : x); }
+
+float fastAtan2(float y, float x) {
+  // simple passthrough to atan2f; left here for possible optimization
+  return atan2f(y, x);
+}
+
+/********************** SENSORS ***************************/
+void readMicrophone() {
+  // Average absolute deviation around tracked DC, then EMA for envelope
+  uint32_t sumAbs = 0;
+  for (int i = 0; i < MIC_SAMPLES; ++i) {
+    int raw = analogRead(MIC_PIN); // 0..4095 (by default)
+    mic_dc = MIC_DC_EMA_A * mic_dc + (1.0f - MIC_DC_EMA_A) * raw;
+    float dev = fabsf(raw - mic_dc);
+    sumAbs += (uint32_t)dev;
+  }
+  float avgAbs = (float)sumAbs / MIC_SAMPLES;           // ~0..4095
+  float envNorm = clampf(avgAbs / (MIC_REF_12BIT * 0.5f), 0.0f, 1.0f); // normalize roughly
+  mic_env = MIC_ENV_EMA_A * mic_env + (1.0f - MIC_ENV_EMA_A) * envNorm;
+}
+
+void readIMU() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  // Acc magnitude deviation from 1g
+  float gmag = sqrtf(a.acceleration.x * a.acceleration.x + a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z) / 9.80665f; // in g
+  acc_mag = fabsf(gmag - 1.0f); // movement intensity ~0 (still) .. >0 (moving)
+
+  // Simple tilt estimation from accelerometer (degrees)
+  // Assuming a.* are in m/s^2, normalize to g vector
+  float ax = a.acceleration.x; 
+  float ay = a.acceleration.y; 
+  float az = a.acceleration.z;
+  // Pitch (rotation around X), Roll (rotation around Y)
+  pitch_deg = atan2f(-ax, sqrtf(ay*ay + az*az)) * 180.0f / PI;
+  roll_deg  = atan2f( ay,       az ) * 180.0f / PI;
+
+  // Pour detection using pitch (tilt forward/back)
+  bool pourNow = fabsf(pitch_deg) > POUR_PITCH_DEG;
+  uint32_t ms = millis();
+  if (pourNow) {
+    if (!pouring) {
+      if (pourStartMs == 0) pourStartMs = ms; 
+      if (ms - pourStartMs > POUR_HOLD_MS) pouring = true;
+    }
+  } else {
+    pourStartMs = 0;
+    pouring = false;
+  }
+}
+
+void readPositionSwitch() {
+  if (POS_PIN < 0) { pos_active = false; return; }
+  int v = digitalRead(POS_PIN);
+  pos_active = POS_ACTIVE_LOW ? (v == LOW) : (v == HIGH);
+}
+
+/********************** MOOD ENGINE ***************************/
+Mood decideMood() {
+  if (pouring) return POURING;
+  // Feature thresholds (tune to taste)
+  // mic_env: 0..1 (quiet..loud)
+  // acc_mag: 0.. ~0.5+ (still..moving)
+  float mic = mic_env;
+  float mov = clampf(acc_mag, 0.0f, 1.0f);
+
+  if (mic < 0.10f && mov < 0.05f) return CALM;      // very quiet, still
+  if (mic < 0.20f && mov < 0.10f) return FOCUS;     // quiet, stable
+  if (mic > 0.45f && mov > 0.20f) return JOY;       // loud & moving
+  if (mic > 0.30f && mov > 0.25f) return PLAYFUL;   // energetic
+  if (mic < 0.18f && mov > 0.25f) return INSPIRE;   // moving but not loud (flow)
+  if (mic < 0.12f && mov < 0.20f) return TIRED;     // calm but a bit droopy
+  return FOCUS;
+}
+
+/********************** COLOR / EFFECTS ***************************/
+uint32_t rgb(uint8_t r, uint8_t g, uint8_t b){ return strip.Color(r,g,b); }
+
+void showSolid(uint32_t c){
+  for (int i=0;i<NUM_LEDS;++i) strip.setPixelColor(i,c);
+  strip.show();
+}
+
+void showBreathing(uint32_t base, uint8_t amplitude, uint16_t periodMs){
+  float phase = (millis() % periodMs) / (float)periodMs; // 0..1
+  float s = 0.5f + 0.5f * sinf(phase * TWO_PI);
+  uint8_t r = (uint8_t)min(255.0f, ((base >> 16) & 0xFF) * (0.4f + 0.6f*s) + amplitude * s);
+  uint8_t g = (uint8_t)min(255.0f, ((base >> 8)  & 0xFF) * (0.4f + 0.6f*s) + amplitude * s);
+  uint8_t b = (uint8_t)min(255.0f, ( base        & 0xFF) * (0.4f + 0.6f*s) + amplitude * s);
+  showSolid(strip.Color(r,g,b));
+}
+
+void showPulse(uint32_t color, uint16_t periodMs){
+  float phase = (millis() % periodMs) / (float)periodMs;
+  float e = (phase < 0.2f) ? (phase/0.2f) : (1.0f - (phase-0.2f)/0.8f); // quick up, slow down
+  e = clampf(e, 0.0f, 1.0f);
+  uint8_t r = (uint8_t)(((color>>16)&0xFF) * e);
+  uint8_t g = (uint8_t)(((color>>8 )&0xFF) * e);
+  uint8_t b = (uint8_t)(( color     &0xFF) * e);
+  showSolid(strip.Color(r,g,b));
+}
+
+void showRainbowCycle(uint8_t speed){
+  static uint16_t hueBase = 0;
+  hueBase += speed; // wraps automatically
+  for (int i=0;i<NUM_LEDS;i++){
+    uint16_t hue = hueBase + i*65535/NUM_LEDS;
+    uint32_t c = strip.gamma32(strip.ColorHSV(hue));
+    strip.setPixelColor(i, c);
+  }
+  strip.show();
+}
+
+void showPourSparkle(){
+  // golden-white falling sparkle to suggest pouring
+  for (int i=0;i<NUM_LEDS;i++){
+    // base warm
+    uint32_t base = strip.Color(180, 100, 10);
+    strip.setPixelColor(i, base);
+    // occasional sparkle
+    if (random(10) == 0) {
+      strip.setPixelColor(i, strip.Color(255, 180, 40));
+    }
+  }
+  strip.show();
+}
+
+/********************** SETUP ***************************/
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // LEDs
+  strip.begin();
+  strip.setBrightness(LED_BRIGHTNESS);
+  strip.show();
+
+  // Position switch
+  if (POS_PIN >= 0) {
+    pinMode(POS_PIN, POS_ACTIVE_LOW ? INPUT_PULLUP : INPUT);
+  }
+
+  // I2C + IMU
+  Wire.begin(I2C_SDA, I2C_SCL, 400000);
+  if (!mpu.begin()){
+    Serial.println("MPU6050 not found! Check wiring.");
+    // fallback: continue without IMU
+  } else {
+    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+    mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+
+  // ADC config
+  analogReadResolution(12);
+  analogSetPinAttenuation(MIC_PIN, ADC_11db); // wider range for mic frontend
+
+  randomSeed(esp_random());
+
+  showSolid(strip.Color(0,0,0));
+}
+
+/********************** LOOP ***************************/
+void loop() {
+  uint32_t ms = millis();
+
+  // SENSOR LOOP ~ SENSOR_HZ
+  if (ms - lastSensorMs >= (1000 / SENSOR_HZ)){
+    lastSensorMs = ms;
+    readMicrophone();
+    readIMU();
+    readPositionSwitch();
+  }
+
+  // MOOD LOOP ~ MOOD_HZ
+  if (ms - lastMoodMs >= (1000 / MOOD_HZ)){
+    lastMoodMs = ms;
+    currentMood = decideMood();
+
+    // If position switch active (e.g., lid closed or a specific posture), bias to CALM
+    if (pos_active && currentMood != POURING) {
+      currentMood = CALM;
+    }
+
+    // Debug
+    Serial.printf("mic_env=%.3f acc_mag=%.3f pitch=%.1f roll=%.1f pos=%d mood=%d\n",
+                  mic_env, acc_mag, pitch_deg, roll_deg, (int)pos_active, (int)currentMood);
+  }
+
+  // RENDER EFFECTS (continuous, non-blocking)
+  switch (currentMood){
+    case CALM:    showBreathing(strip.Color(180, 90, 0), 12, 2200); break;     // warm amber, slow
+    case FOCUS:   showPulse(strip.Color(160, 160, 160), 1200); break;          // soft white pulse
+    case JOY:     showRainbowCycle(256); break;                                // fast rainbow
+    case PLAYFUL: showRainbowCycle(64);  break;                                // slower rainbow
+    case INSPIRE: showBreathing(strip.Color(40, 180, 60), 20, 1800); break;    // green-gold
+    case TIRED:   showBreathing(strip.Color(30, 80, 160), 10, 3000); break;    // cool blue
+    case POURING: showPourSparkle(); break;                                    // golden sparkle
+  }
+}
+
+/********************** WIRING NOTES ***************************
+ESP32 → Components
+- WS2812: 5V & GND shared; Data: GPIO5 through 300-470Ω series resistor; add 1000µF cap across 5V-GND
+- Microphone (electret or analog mic module with op-amp): output → GPIO34; GND common; Vcc (per module)
+- MPU-6050: SDA→GPIO21, SCL→GPIO22, Vcc→3.3V, GND→GND
+- Position switch (optional tilt/reed): one side → GND, other → GPIO27 (with INPUT_PULLUP)
+
+Tuning:
+- Adjust thresholds in decideMood() to match your environment
+- Set POUR_PITCH_DEG to the tilt angle that represents pouring in your kettle geometry
+- If your microphone is too hot/quiet, tweak ADC attenuation and normalization
+****************************************************************/
